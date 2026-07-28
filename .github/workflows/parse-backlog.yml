@@ -91,6 +91,16 @@ jobs:
         # bindings are platform-specific and the committed copy is built for the dev machine.
         run: npm install @libsql/client --force --no-save 2>&1 | tail -3
 
+      - name: Stage Oodle libraries at the working directory
+        # liblinoodle is a PE loader and resolves oo2core_8_win64.dll relative to the CWD, not to
+        # its own location. The VPS has copies sitting at the repo root from some past manual step,
+        # which is the only reason it works there - they are not in git. Without this a fresh
+        # checkout aborts with `what(): Failed to parse PE` before a single replay is parsed.
+        run: |
+          cp node_modules/@theauthenticator/fortnite-replay-parser/oo2core_8_win64.dll . 2>/dev/null || true
+          cp node_modules/@theauthenticator/fortnite-replay-parser/liblinoodle.so . 2>/dev/null || true
+          ls -la oo2core_8_win64.dll liblinoodle.so
+
       - name: Parse
         env:
           WORKER_ID: gha-${{ github.run_id }}-${{ matrix.shard }}
