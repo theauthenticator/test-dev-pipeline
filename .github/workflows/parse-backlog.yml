@@ -1,0 +1,127 @@
+# Parses whatever is currently unparsed, by claiming it from Turso.
+#
+# There is no work assignment here on purpose. Runners are not told which replays to take - each
+# one claims its own with an atomic UPDATE ... RETURNING that stamps a lease, so two runners can
+# never get the same replay and a runner that dies just lets its lease lapse. That means the count
+# below is a throughput dial, not a partition: 4 runners and 20 runners both parse the same backlog
+# correctly, one just finishes sooner.
+#
+# The worker lives in the private replay-worker repo and is checked out here rather than vendored,
+# so it can't drift from what the VPS runs.
+
+name: Parse backlog
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: 'Parallel runners (1-20)'
+        required: false
+        default: '4'
+      window_id:
+        description: 'Restrict to one window_id (blank = any unparsed replay)'
+        required: false
+        default: ''
+      worker_ref:
+        description: 'Branch of replay-worker to run (test a branch before merging it to main)'
+        required: false
+        default: 'main'
+  repository_dispatch:
+    types: [parse_burst]
+
+# Let bursts overlap - leases make that safe - but never cancel a run mid-parse.
+concurrency:
+  group: parse-backlog
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      window_id: ${{ steps.plan.outputs.window_id }}
+    steps:
+      - id: plan
+        run: |
+          RUNNERS="${{ github.event.inputs.runners || github.event.client_payload.runners || '4' }}"
+          WINDOW="${{ github.event.inputs.window_id || github.event.client_payload.window_id || '' }}"
+
+          # Free-plan concurrency tops out at 20; asking for more just queues jobs behind each other.
+          [ "$RUNNERS" -gt 20 ] 2>/dev/null && RUNNERS=20
+          [ "$RUNNERS" -lt 1 ] 2>/dev/null && RUNNERS=1
+
+          echo "shards=$(seq 1 "$RUNNERS" | jq -Rsc 'split("\n")[:-1]')" >> "$GITHUB_OUTPUT"
+          echo "window_id=$WINDOW" >> "$GITHUB_OUTPUT"
+          echo "→ $RUNNERS runner(s), window='${WINDOW:-any}'"
+
+  parse:
+    needs: plan
+    runs-on: ubuntu-latest
+    # Hard cap is 360. Staying under it matters: BUDGET_MINUTES below must leave enough room for
+    # an in-flight parse to finish, or the runner is killed mid-parse and those replays sit claimed
+    # until their lease expires.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+
+    steps:
+      - name: Check out worker source
+        uses: actions/checkout@v4
+        with:
+          repository: theauthenticator/replay-worker
+          token: ${{ secrets.WORKER_REPO_TOKEN }}
+          # Defaults to main. Override for a first run so the branch can be proven before it is
+          # merged - the worker only exists on chore/vps-cleanup-cron until you merge it.
+          ref: ${{ github.event.inputs.worker_ref || github.event.client_payload.worker_ref || 'main' }}
+
+      - name: Drop committed secrets from the checkout
+        # replay-worker tracks .env / .npmrc. Config comes from Actions secrets instead, so the
+        # checked-out copies are removed before anything can read them.
+        run: rm -f .env .env.production .npmrc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Rebuild libsql bindings for linux
+        # node_modules is committed, which is why there is no npm install here - the parser and its
+        # ffi-napi linux-x64 prebuild come with the checkout. @libsql/client is the exception: its
+        # bindings are platform-specific and the committed copy is built for the dev machine.
+        run: npm install @libsql/client --force --no-save 2>&1 | tail -3
+
+      - name: Parse
+        env:
+          WORKER_ID: gha-${{ github.run_id }}-${{ matrix.shard }}
+          PARSE_CONCURRENCY: '4'
+          WINDOW_ID: ${{ needs.plan.outputs.window_id }}
+          BUDGET_MINUTES: '320'
+          IDLE_EXIT_SECONDS: '120'
+          LEASE_MINUTES: '15'
+          PARSE_TIMEOUT_MINUTES: '10'
+          RETRY_STATUS: READY_FOR_DOWNLOAD_VPS1
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          AWS_DYNAMODB_REGION: ${{ secrets.AWS_DYNAMODB_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          DYNAMO_TABLE: ${{ secrets.DYNAMO_TABLE }}
+        # The exit code is not a usable success signal here. The native replay parser holds worker
+        # threads that never exit and cannot be terminated without faulting inside the addon, so the
+        # process dies with an access violation during teardown - after every replay has been
+        # parsed, stored and marked PARSED. Asserting on the sentinel checks what actually matters:
+        # that the worker reached the end of its drain. A crash before that point leaves no sentinel
+        # and still fails the job.
+        run: |
+          set -o pipefail
+          set +e
+          node src/workers/pull-worker.js 2>&1 | tee run.log
+          set -e
+          if ! grep -q 'PULL_WORKER_COMPLETE' run.log; then
+            echo "::error::worker did not reach completion - see log above"
+            exit 1
+          fi
+          grep 'PULL_WORKER_COMPLETE' run.log
