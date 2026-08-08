@@ -72,8 +72,12 @@ jobs:
         with:
           repository: theauthenticator/replay-worker
           token: ${{ secrets.WORKER_REPO_TOKEN }}
-          # Defaults to main. Override for a first run so the branch can be proven before it is
-          # merged - the worker only exists on chore/vps-cleanup-cron until you merge it.
+          # Defaults to main, which carries the pull worker. Override to prove a branch before
+          # merging it.
+          #
+          # Note what this ref actually decides: pull-worker.js runs ONLY here, never on the VPS
+          # (no pm2 entry references it), so `npm run deploy` in replay-worker does not reach it.
+          # A pull-worker change is live for burst parsing only once it is pushed to this ref.
           ref: ${{ github.event.inputs.worker_ref || github.event.client_payload.worker_ref || 'main' }}
 
       - name: Drop committed secrets from the checkout
