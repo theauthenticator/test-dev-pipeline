@@ -6,6 +6,38 @@ This repo holds a workflow and nothing else. It contains no parser code, no repl
 credentials — the worker is checked out at run time from the private `replay-worker` repo, and all
 configuration comes from repository secrets.
 
+## Parser dependency chain
+
+This repo does **not** depend on `@theauthenticator/fortnite-replay-parser` directly.
+
+```text
+fortnite-replay-parser  (published package)
+        │
+        ▼
+   replay-worker        (pins + vendors the package in committed node_modules)
+        │
+        ▼
+ test-dev-pipeline      (checks out replay-worker at worker_ref; no npm install of the parser)
+```
+
+| Layer | Repo | How the parser arrives |
+|---|---|---|
+| Source | `theauthenticator` fortnite-replay-parser package | Built and published (GitHub Packages) |
+| Worker | [`theauthenticator/replay-worker`](https://github.com/theauthenticator/replay-worker) | `package.json` pin + **committed** `node_modules/@theauthenticator/fortnite-replay-parser` |
+| Burst CI | this repo | `actions/checkout` of `replay-worker` at `worker_ref` (default `main`) |
+
+The workflow intentionally skips `npm install` for the parser. Committed `node_modules` already contain the parser, bundled `ffi-napi` prebuilds (including `linux-x64`), and Oodle libraries. Only `@libsql/client` is reinstalled so Linux native bindings match the runner.
+
+### Getting a parser bump into burst runs
+
+1. Publish a new `@theauthenticator/fortnite-replay-parser` version.
+2. In **replay-worker**: bump the dependency, reinstall, commit the updated `package.json` / lockfile **and** the vendored `node_modules/@theauthenticator/fortnite-replay-parser` tree (including nested `ffi-napi` / Oodle files), then push the branch you want burst to use (usually `main`).
+3. Run this workflow with `worker_ref` pointing at that branch (leave blank / `main` for production).
+
+Bumping only `package.json` in replay-worker is not enough. Burst never resolves the package from the registry; it runs whatever was committed under `node_modules`.
+
+`npm run deploy` in replay-worker updates the VPS workers. It does **not** update this repo. Burst picks up pull-worker / parser changes only after they are on the `worker_ref` checkout.
+
 ## How it works
 
 Runners are never told which replays to parse. Each one claims its own work directly from the
