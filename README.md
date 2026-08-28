@@ -35,6 +35,8 @@ The workflow intentionally skips `npm install` for the parser. Committed `node_m
 3. Run this workflow with `worker_ref` pointing at that branch (leave blank / `main` for production).
 
 Bumping only `package.json` in replay-worker is not enough. Burst never resolves the package from the registry; it runs whatever was committed under `node_modules`.
+There is intentionally no parser package bump in this repo. The only version selection here is the
+`worker_ref` input, which chooses the replay-worker checkout that already vendors the parser.
 
 `npm run deploy` in replay-worker updates the VPS workers. It does **not** update this repo. Burst picks up pull-worker / parser changes only after they are on the `worker_ref` checkout.
 
