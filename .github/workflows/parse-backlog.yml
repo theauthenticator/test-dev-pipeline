@@ -67,6 +67,28 @@ jobs:
         shard: ${{ fromJson(needs.plan.outputs.shards) }}
 
     steps:
+      - name: Verify worker repo credential
+        # actions/checkout cannot report a bad credential usefully: git drops the rejected auth
+        # header and falls back to prompting, so an expired or revoked WORKER_REPO_TOKEN surfaces
+        # as "could not read Username for 'https://github.com'" three times over ~30s and says
+        # nothing about the token. PATs expire on their own schedule, so this is a recurring
+        # failure, not a one-off. Check the token first and name the actual problem.
+        env:
+          WORKER_REPO_TOKEN: ${{ secrets.WORKER_REPO_TOKEN }}
+        run: |
+          if [ -z "$WORKER_REPO_TOKEN" ]; then
+            echo "::error::WORKER_REPO_TOKEN is not set on this repository. Add a PAT with read access to theauthenticator/replay-worker."
+            exit 1
+          fi
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}'             -H "Authorization: Bearer $WORKER_REPO_TOKEN"             -H "Accept: application/vnd.github+json"             https://api.github.com/repos/theauthenticator/replay-worker)
+          case "$CODE" in
+            200) echo "✓ WORKER_REPO_TOKEN can read replay-worker" ;;
+            401) echo "::error::WORKER_REPO_TOKEN is expired or revoked (401). Rotate the PAT and update the WORKER_REPO_TOKEN secret."; exit 1 ;;
+            403) echo "::error::WORKER_REPO_TOKEN is rejected (403) - SSO authorization or rate limit. Re-authorize the PAT for the org."; exit 1 ;;
+            404) echo "::error::WORKER_REPO_TOKEN cannot see theauthenticator/replay-worker (404). It needs Contents: read on that private repo."; exit 1 ;;
+            *)   echo "::error::Unexpected $CODE from the GitHub API while checking WORKER_REPO_TOKEN."; exit 1 ;;
+          esac
+
       - name: Check out worker source
         uses: actions/checkout@v4
         with:
