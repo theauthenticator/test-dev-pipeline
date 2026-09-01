@@ -26,6 +26,10 @@ on:
         description: 'Branch of replay-worker to run (test a branch before merging it to main)'
         required: false
         default: 'main'
+      target:
+        description: 'Capacity label for this repo (tags WORKER_ID so the dispatcher can count these runners separately)'
+        required: false
+        default: ''
   repository_dispatch:
     types: [parse_burst]
 
@@ -50,23 +54,45 @@ jobs:
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       window_id: ${{ steps.plan.outputs.window_id }}
+      target: ${{ steps.plan.outputs.target }}
     steps:
       - id: plan
+        env:
+          # Concurrency ceiling for THIS repo. Hosted runners on a free account top out at 20, so
+          # that is the default; a paid plan or a self-hosted pool can go higher. It is a repo
+          # variable rather than a literal because the same workflow file is deployed to every
+          # capacity target and only the ceiling differs between them.
+          MAX_RUNNERS: ${{ vars.MAX_RUNNERS || '20' }}
+          # Names this repo's capacity in the runner IDs it produces. Falls back to the repo name,
+          # so a target that was provisioned without setting anything still reports as itself
+          # rather than sharing an untagged bucket with every other target.
+          DEFAULT_TARGET: ${{ github.event.repository.name }}
         run: |
           RUNNERS="${{ github.event.inputs.runners || github.event.client_payload.runners || '4' }}"
           WINDOW="${{ github.event.inputs.window_id || github.event.client_payload.window_id || '' }}"
+          TARGET="${{ github.event.inputs.target || github.event.client_payload.target || '' }}"
 
-          # Free-plan concurrency tops out at 20; asking for more just queues jobs behind each other.
-          [ "$RUNNERS" -gt 20 ] 2>/dev/null && RUNNERS=20
+          # Asking for more than the ceiling just queues jobs behind each other.
+          [ "$RUNNERS" -gt "$MAX_RUNNERS" ] 2>/dev/null && RUNNERS="$MAX_RUNNERS"
           [ "$RUNNERS" -lt 1 ] 2>/dev/null && RUNNERS=1
+
+          # burst-dispatch matches runners back to a target by the `gha-<target>-` prefix, so the
+          # label has to survive as a plain slug - anything else is normalised rather than left to
+          # produce IDs no dispatcher will ever count.
+          [ -z "$TARGET" ] && TARGET="$DEFAULT_TARGET"
+          TARGET=$(printf '%s' "$TARGET" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed 's/^-*//;s/-*$//')
+          [ -z "$TARGET" ] && TARGET="unnamed"
 
           echo "shards=$(seq 1 "$RUNNERS" | jq -Rsc 'split("\n")[:-1]')" >> "$GITHUB_OUTPUT"
           echo "window_id=$WINDOW" >> "$GITHUB_OUTPUT"
-          echo "→ $RUNNERS runner(s), window='${WINDOW:-any}'"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "→ $RUNNERS runner(s) (ceiling $MAX_RUNNERS), target='$TARGET', window='${WINDOW:-any}'"
 
   parse:
     needs: plan
-    runs-on: ubuntu-latest
+    # Defaults to hosted runners. A target that has its own machines sets the RUNS_ON repo variable
+    # (e.g. `self-hosted`) and gets the same workflow with no concurrency ceiling to work around.
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     # Hard cap is 360. Staying under it matters: BUDGET_MINUTES below must leave enough room for
     # an in-flight parse to finish, or the runner is killed mid-parse and those replays sit claimed
     # until their lease expires.
@@ -139,7 +165,11 @@ jobs:
 
       - name: Parse
         env:
-          WORKER_ID: gha-${{ github.run_id }}-${{ matrix.shard }}
+          # The `gha-` prefix is what marks a lease as belonging to a burst runner rather than the
+          # VPS pool, and the target segment is what lets burst-dispatch tell one capacity target's
+          # runners from another's. Changing either shape breaks that accounting - see
+          # countActiveRunners in replay-worker's burst-dispatch.js.
+          WORKER_ID: gha-${{ needs.plan.outputs.target }}-${{ github.run_id }}-${{ matrix.shard }}
           PARSE_CONCURRENCY: '4'
           WINDOW_ID: ${{ needs.plan.outputs.window_id }}
           BUDGET_MINUTES: '320'

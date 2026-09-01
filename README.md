@@ -66,13 +66,56 @@ Actions → **Parse backlog** → **Run workflow**
 
 | input | default | notes |
 |---|---|---|
-| `runners` | `4` | clamped to 1–20 (free-plan concurrency ceiling) |
+| `runners` | `4` | clamped to 1–`MAX_RUNNERS` |
 | `window_id` | *(blank)* | restrict to one tournament window |
 | `worker_ref` | `main` | branch of `replay-worker` to run |
+| `target` | *(repo name)* | capacity label; tags `WORKER_ID` so the dispatcher can count this repo's runners separately |
 
 It also accepts `repository_dispatch` with `event_type: parse_burst` and a
-`{ runners, window_id }` payload, which is what `burst-dispatch.js` on the VPS sends when a
-backlog appears.
+`{ runners, window_id, worker_ref, target }` payload, which is what `burst-dispatch.js` on the VPS
+sends when a backlog appears.
+
+### Repository variables
+
+Two knobs are variables rather than literals, because this same file is deployed to every capacity
+target and only these differ between them.
+
+| variable | default | notes |
+|---|---|---|
+| `MAX_RUNNERS` | `20` | concurrency ceiling for this repo. 20 is the free-plan cap on hosted runners; raise it for a paid plan or a self-hosted pool |
+| `RUNS_ON` | `ubuntu-latest` | set to `self-hosted` (or a label) to run this repo's shards on your own machines, which have no concurrency cap |
+
+## More capacity than one repo can give
+
+Concurrent jobs are capped per account, so a single repo tops out well below what a tournament
+backlog needs. Capacity scales by adding more repos holding this same workflow — a second org, a
+paid plan, or a repo pointed at self-hosted runners all look identical to the dispatcher.
+
+This is safe precisely because of the claim model above: runners are never assigned work, so
+targets need no coordination with each other and cannot duplicate or strand anything. Two repos
+with 20 runners each and one repo with 40 parse the same backlog identically.
+
+What ties them together is the `target` label. Each run stamps its shards
+`gha-<target>-<run_id>-<shard>`, and `burst-dispatch.js` buckets live leases by that prefix so it
+can tell a target that is already saturated from one sitting idle. A target whose label does not
+match its entry in `config/burst-targets.json` still parses correctly — it is just invisible to the
+sizing logic, which will keep asking it for runners it already has.
+
+To stamp a new target, from the `replay-worker` checkout:
+
+```bash
+GH_TOKEN=<PAT for the target account> scripts/provision-burst-target.sh owner/repo 20
+```
+
+It creates the repo, syncs this workflow, sets `MAX_RUNNERS`, and reports which of the nine secrets
+still need values. It does not copy secret values between accounts — it prints the `gh secret set`
+commands and leaves that to you.
+
+A note on where the capacity comes from: spreading across additional **free personal accounts** to
+get past the 20-job cap is against GitHub's Acceptable Use Policy, and accounts doing it are liable
+to be flagged. Self-hosted runners have no concurrency cap and cost nothing in Actions minutes, and
+a paid plan raises the cap directly (Team 60, Enterprise 500). The workflow is identical either
+way — only `RUNS_ON` and `MAX_RUNNERS` change.
 
 ## Required secrets
 
