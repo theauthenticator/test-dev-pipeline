@@ -29,9 +29,19 @@ on:
   repository_dispatch:
     types: [parse_burst]
 
-# Let bursts overlap - leases make that safe - but never cancel a run mid-parse.
+# Let bursts overlap - leases make that safe - by giving every run its own group.
+#
+# A shared group does NOT do that, even with cancel-in-progress off. GitHub holds at most one
+# running plus one pending run per group and cancels whatever pending run a newer dispatch
+# supersedes, so with runs living up to 350 minutes and the dispatcher polling every 30, a single
+# long run pinned burst capacity at whatever that first run happened to ask for and every later
+# dispatch was cancelled without ever starting a job. `cancel-in-progress: false` only ever
+# protected the run already going; it never let a second one alongside it.
+#
+# Keying on run_id means no run is ever queued behind or cancelled by another, which is what the
+# lease model already made safe: overlapping runners cannot claim the same replay.
 concurrency:
-  group: parse-backlog
+  group: parse-backlog-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
